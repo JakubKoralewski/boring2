@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 use crate::config::Config;
-use crate::prefix::{prefix_symbols, PrefixCallback};
+use crate::prefix::PrefixCallback;
 
 mod config;
 mod prefix;
@@ -200,8 +200,10 @@ fn get_boringssl_platform_output_path(config: &Config) -> String {
 ///
 /// It will add platform-specific parameters if needed.
 fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
-    let src_path = get_boringssl_source_path(config);
-    let mut boringssl_cmake = cmake::Config::new(src_path);
+    let mut src_path = get_boringssl_source_path(config).clone();
+    // use boringssl/src/CMakeLists.txt (instead of boringssl/CMakeLists.txt)  because it contains `if(BORINGSSL_PREFIX AND BORINGSSL_PREFIX_SYMBOLS)`
+    src_path.push("src"); 
+    let mut boringssl_cmake = cmake::Config::new(&src_path);
 
     if config.host == config.target {
         return boringssl_cmake;
@@ -515,6 +517,59 @@ fn run_command(command: &mut Command) -> io::Result<Output> {
     Ok(out)
 }
 
+fn symbols_out_file_path() -> PathBuf {
+    let mut symbol_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    symbol_file.push("symbols-out.txt");
+
+    symbol_file
+}
+
+/// Use BoringSSL's internal tool to read symbols.
+/// 
+/// See deps/boringssl/BUILDING.md#Building with Prefixed Symbols
+#[allow(
+    dead_code,
+    reason="Might be useful to regenerate symbols-out.txt. Better than commenting out so any future refactorings keep this code working."
+)]
+fn symbols_out_file_generate(config: &Config, cfg: &mut cmake::Config) {
+    let symbol_file = symbols_out_file_path();
+
+    let mut boring_ssl_source_path = get_boringssl_source_path(&config).clone();
+    boring_ssl_source_path.push("src/util");
+    let util = boring_ssl_source_path;
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let godir = Path::new(&out_dir).join("gocache");
+    std::fs::create_dir_all(&godir).unwrap();
+
+    // build them - so we can read the symbols that are public (as instructed by boringssl documentation)
+    cfg.build_target("ssl").build();
+    let first_pass_out = cfg.build_target("crypto").build();
+
+    // we just built them
+    let libcrypto = first_pass_out.join("build/crypto/libcrypto.a");
+    let libssl = first_pass_out.join("build/ssl/libssl.a");
+
+    let mut cmd_def = std::process::Command::new("go");
+        cmd_def
+        .args([
+            "run", 
+            "./read_symbols.go", 
+            libcrypto.to_str().unwrap(),
+            libssl.to_str().unwrap()
+        ])
+        .env("GOPATH", &godir) 
+        .current_dir(util)
+        .stdout(std::fs::File::create(&symbol_file).unwrap());
+    let status = cmd_def
+        .status()
+        .expect(&format!("Failed to generate symbol list: {cmd_def:?}"));
+    
+    if !status.success() {
+        panic!("reading symbols failed: {:?}", status);
+    }
+}
+
 fn built_boring_source_path(config: &Config) -> &PathBuf {
     if let Some(path) = &config.env.path {
         return path;
@@ -543,6 +598,16 @@ fn built_boring_source_path(config: &Config) -> &PathBuf {
 
         if config.features.prefix_symbols {
             cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+
+            let symbol_file = symbols_out_file_path();
+            println!("cargo::rerun-if-changed={symbol_file:?}");
+
+            // symbols_out_file_generate(config, &mut cfg);
+
+            cfg.define("BORINGSSL_PREFIX", "b2");
+            let symbol_file = symbol_file.to_str().unwrap();
+            println!("cargo:warning={symbol_file:?}");
+            cfg.define("BORINGSSL_PREFIX_SYMBOLS", symbol_file);
         }
 
         cfg.build_target("ssl").build();
@@ -582,7 +647,7 @@ fn main() {
             }
             _ => {
                 if !config.env.docs_rs {
-                    prefix_symbols(&config)
+                    // prefix_symbols(&config)
                 }
             }
         }
